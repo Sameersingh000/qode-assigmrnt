@@ -1,4 +1,4 @@
-import re, pandas as pd, os, time as tm, random, nltk
+import re, pandas as pd, os, time, random, nltk
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 from nltk.corpus import stopwords
@@ -8,12 +8,15 @@ from collections import Counter
 
 class TwitterScraper:
     def __init__(self):
+        nltk.download(['stopwords', 'punkt'], quiet=True)
         self.tweets_data = []
         self.hashtags = ["naukri", "jobs", "jobseeker", "vacancy"]
         self.target_count, self.scroll_attempts, self.max_scroll_attempts = 2000, 0, 300
         self.seen_tweets, self.user_data_dir = set(), "twitter_session"
-        nltk.download('stopwords', quiet=True), nltk.download('punkt', quiet=True)
-        self.stop_words = set(stopwords.words('english'))
+        self.stop_words, self.hashtag_limits = set(stopwords.words('english')), {h:500 for h in self.hashtags}
+        self.current_hashtag_index, self.max_attempts_per_hashtag = 0, 3
+        self.min_tweets_per_round, self.session_timeout = 50, 120
+        self.rate_limit_wait, self.rate_limit_retries = 600, 3
 
     def preprocess_text(self, text):
         text = re.sub(r'http\S+|www\S+|https\S+', '', str(text).lower(), flags=re.MULTILINE)
@@ -22,56 +25,97 @@ class TwitterScraper:
 
     def scrape_tweets(self):
         with sync_playwright() as pw:
-            browser = pw.chromium.launch_persistent_context(
-                self.user_data_dir, headless=False, channel="chrome",
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                viewport={"width": 1280, "height": 720}, timeout=120000)
+            browser = self.init_browser(pw)
             page = browser.new_page()
             self.handle_login(page)
-            [self.scrape_hashtag(page, h) for h in self.hashtags if len(self.tweets_data) < self.target_count]
-            self.save_data(), self.analyze_data(), browser.close()
+            
+            start_time, rate_limit_retries = time.time(), 0
+            while (len(self.tweets_data) < self.target_count and self.scroll_attempts < self.max_scroll_attempts 
+                   and time.time() - start_time < 3600 and rate_limit_retries < self.rate_limit_retries):
+                try:
+                    for i, hashtag in enumerate(self.hashtags):
+                        if self.hashtag_limits[hashtag] <= 0: continue
+                        print(f"\nTargets: Total {len(self.tweets_data)}/{self.target_count} | #{hashtag} {500-self.hashtag_limits[hashtag]}/500")
+                        
+                        if self.scrape_hashtag(page, hashtag) == "rate_limit":
+                            rate_limit_retries += 1
+                            time.sleep(self.rate_limit_wait)
+                            page.close(); browser.close()
+                            browser, page = self.init_browser(pw), browser.new_page()
+                            self.handle_login(page)
+                            i -= 1
+                            continue
+                            
+                        if len(self.tweets_data) >= self.target_count: break
+                        time.sleep(random.uniform(2, 5))
+                except Exception as e: print(f"Error: {str(e)}")
+            
+            self.save_data(); self.analyze_data(); browser.close()
+
+    def init_browser(self, pw):
+        return pw.chromium.launch_persistent_context(
+            self.user_data_dir, headless=False, channel="chrome",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            viewport={"width": 1280, "height": 720}, timeout=120000)
 
     def handle_login(self, page):
         page.goto("https://twitter.com/login", timeout=60000)
         try: page.wait_for_selector("text=Home", timeout=15000)
-        except: print("Manual login required"); page.wait_for_selector("text=Home", timeout=120000)
+        except: 
+            print("Manual login required")
+            page.wait_for_selector("text=Home", timeout=120000)
 
     def scrape_hashtag(self, page, hashtag):
-        print(f"\nScraping #{hashtag}...")
-        for attempt in range(3):
+        attempts, collected_in_session, session_start = 0, 0, time.time()
+        while (self.hashtag_limits[hashtag] > 0 and attempts < self.max_attempts_per_hashtag 
+               and len(self.tweets_data) < self.target_count and time.time() - session_start < self.session_timeout):
             try:
-                page.goto(f"https://twitter.com/search?q=%23{hashtag}&src=typed_query&f=live", timeout=60000)
-                page.wait_for_selector('article[data-testid="tweet"]', timeout=30000)
-                break
-            except Exception as e:
-                if attempt == 2: return print(f"Failed to load #{hashtag}")
-                tm.sleep(5)
-        
-        last_pos, no_new = page.evaluate("window.scrollY"), 0
-        while len(self.tweets_data) < self.target_count and self.scroll_attempts < self.max_scroll_attempts:
-            self.scroll_attempts += 1
-            page.keyboard.press("End"), tm.sleep(random.uniform(1.5, 3.5))
-            self.dismiss_popups(page)
-            tweets = page.query_selector_all('article[data-testid="tweet"]')
-            new_tweets = self.process_tweets(tweets[-25:])
-            curr_pos = page.evaluate("window.scrollY")
-            no_new = no_new + 1 if curr_pos == last_pos else 0
-            if no_new > 5: break
-            last_pos, no_new = (curr_pos, 0) if curr_pos != last_pos else (last_pos, no_new)
-            print(f"Progress: {len(self.tweets_data)}/{self.target_count} tweets")
+                if attempts > 0 or collected_in_session == 0:
+                    page.goto(f"https://twitter.com/search?q=%23{hashtag}&src=typed_query&f=live", timeout=60000)
+                    try: page.wait_for_selector('article[data-testid="tweet"]', timeout=30000)
+                    except: return "rate_limit" if page.query_selector("text=Rate limit exceeded") else ""
+                    time.sleep(random.uniform(2, 4))
+                
+                last_pos, no_new_count, session_tweets = page.evaluate("window.scrollY"), 0, 0
+                while (self.hashtag_limits[hashtag] > 0 and session_tweets < self.min_tweets_per_round 
+                       and no_new_count < 5 and len(self.tweets_data) < self.target_count 
+                       and time.time() - session_start < self.session_timeout):
+                    self.scroll_attempts += 1
+                    page.keyboard.press("End"); time.sleep(random.uniform(1.5, 3.5))
+                    self.dismiss_popups(page)
+                    if page.query_selector("text=Rate limit exceeded"): return "rate_limit"
+                    
+                    tweets = page.query_selector_all('article[data-testid="tweet"]')
+                    new_tweets = self.process_tweets(tweets[-20:], hashtag)
+                    session_tweets += new_tweets; collected_in_session += new_tweets
+                    
+                    curr_pos = page.evaluate("window.scrollY")
+                    no_new_count = no_new_count + 1 if curr_pos == last_pos else 0
+                    last_pos = curr_pos
+                    print(f"Collected: {new_tweets} new | Total: {len(self.tweets_data)}/{self.target_count} | #{hashtag}: {500-self.hashtag_limits[hashtag]}/500")
+                    
+                    if no_new_count > 3: print("No new tweets, moving on..."); break
+                
+                if session_tweets < 10: 
+                    attempts += 1; print(f"Attempt {attempts}/{self.max_attempts_per_hashtag} for #{hashtag}")
+                    time.sleep(5)
+            except Exception as e: 
+                print(f"Error scraping #{hashtag}: {str(e)}"); attempts += 1; time.sleep(5)
 
     def dismiss_popups(self, page):
-        for text in ["Sign up", "Log in"]:
-            if page.query_selector(f"text='{text}'"): page.mouse.click(10, 10), tm.sleep(1)
+        if any(page.query_selector(f"text='{t}'") for t in ["Sign up", "Log in"]): 
+            page.mouse.click(10, 10); time.sleep(1)
 
-    def process_tweets(self, tweets):
+    def process_tweets(self, tweets, hashtag):
         new = 0
         for t in tweets:
             try:
                 c = t.query_selector("div[data-testid='tweetText']").inner_text()
                 if c in self.seen_tweets: continue
+                
                 un = t.query_selector("div[data-testid='User-Name']").inner_text().strip()
                 dt = t.query_selector("time").get_attribute("datetime").split('T')
+                
                 self.tweets_data.append({
                     "Username": un, "Tweet": c.strip(), "Cleaned_Tweet": self.preprocess_text(c),
                     "Date": dt[0], "Time": dt[1].split('.')[0],
@@ -82,10 +126,12 @@ class TwitterScraper:
                     "Comments": self.get_metric(t, "div[data-testid='reply']"),
                     "Views": self.get_metric(t, "div[aria-label*='views']", True),
                     "Replies": self.estimate_replies(t),
-                    "Sentiment": TextBlob(c).sentiment.polarity
+                    "Sentiment": TextBlob(c).sentiment.polarity,
+                    "Source_Hashtag": hashtag
                 })
-                self.seen_tweets.add(c)
-                new += 1
+                
+                self.seen_tweets.add(c); new += 1; self.hashtag_limits[hashtag] -= 1
+                if self.hashtag_limits[hashtag] <= 0: break
             except: continue
         return new
 
@@ -93,7 +139,8 @@ class TwitterScraper:
         try:
             m = el.query_selector(sel)
             if not m: return "0"
-            return re.search(r'\d+', m.get_attribute("aria-label").replace(',', ''))[0] if is_aria else m.inner_text().replace(',', '') or "0"
+            text = m.get_attribute("aria-label") if is_aria else m.inner_text()
+            return re.search(r'\d+', text.replace(',', ''))[0] if text else "0"
         except: return "0"
 
     def estimate_replies(self, t):
@@ -104,15 +151,14 @@ class TwitterScraper:
 
     def save_data(self):
         if not self.tweets_data: return print("No data to save")
-        df = pd.DataFrame(self.tweets_data)
         os.makedirs("twitter_data", exist_ok=True)
-        cols = ['Likes', 'Retweets', 'Comments', 'Replies', 'Views']
-        df[cols] = df[cols].apply(pd.to_numeric, errors='coerce').fillna(0)
-        if os.path.exists(fn := "twitter_data/tweets_combined.csv"):
-            existing = pd.read_csv(fn)
-            pd.concat([existing, df]).drop_duplicates(subset=['Tweet']).to_csv(fn, index=False)
-            print(f"\nAppended {len(df)} tweets. Total: {len(existing) + len(df)}")
-        else: df.to_csv(fn, index=False), print(f"\nSaved {len(df)} tweets")
+        df = pd.DataFrame(self.tweets_data)
+        df[['Likes', 'Retweets', 'Comments', 'Replies', 'Views']] = df[['Likes', 'Retweets', 'Comments', 'Replies', 'Views']].apply(pd.to_numeric, errors='coerce').fillna(0)
+        filename = "twitter_data/tweets_combined.csv"
+        if os.path.exists(filename):
+            df = pd.concat([pd.read_csv(filename), df]).drop_duplicates(subset=['Tweet'])
+        df.to_csv(filename, index=False)
+        print(f"\nSaved {len(df)} tweets to {filename}")
 
     def analyze_data(self):
         if not self.tweets_data: return print("No data to analyze")
@@ -120,14 +166,16 @@ class TwitterScraper:
         df['Sentiment_Label'] = df['Sentiment'].apply(lambda x: 'Positive' if x > 0.1 else 'Negative' if x < -0.1 else 'Neutral')
         all_tags = [tag for sub in df['Hashtags'].str.split(', ') for tag in sub if tag]
         stats = df[['Likes', 'Retweets', 'Comments', 'Replies', 'Views']].describe()
-        df['DateTime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
-        hourly = df.groupby(df['DateTime'].dt.hour).size()
+        hourly = df.groupby(pd.to_datetime(df['Date'] + ' ' + df['Time']).dt.hour.size())
         
         with open("twitter_data/analysis_report.txt", "w") as f:
             f.write(f"""Twitter Data Analysis Report
 ===========================
 Collected Tweets: {len(df)}
 Time Period: {df['Date'].min()} to {df['Date'].max()}
+
+Hashtag Distribution:
+{chr(10).join([f'#{k}: {v}' for k,v in df['Source_Hashtag'].value_counts().items()])}
 
 Key Metrics:
 - Average Likes: {stats.loc['mean', 'Likes']:.1f}
@@ -147,11 +195,17 @@ Engagement Patterns:
 - Lowest: {hourly.idxmin()}:00 ({hourly.min()} tweets)""")
 
         plt.figure(figsize=(15, 10))
-        plt.subplot(2,2,1), pd.Series(dict(Counter(all_tags).most_common(10))).plot(kind='bar'), plt.title('Top 10 Hashtags')
-        plt.subplot(2,2,2), df['Sentiment_Label'].value_counts().plot(kind='pie', autopct='%1.1f%%'), plt.title('Sentiment')
-        plt.subplot(2,2,3), hourly.plot(kind='line'), plt.title('Hourly Activity'), plt.xlabel('Hour'), plt.ylabel('Tweets')
-        plt.tight_layout(), plt.savefig("twitter_data/visualizations.png")
-        print("Analysis complete")
+        plots = [
+            ('Top 10 Hashtags', pd.Series(dict(Counter(all_tags).most_common(10)).plot(kind='bar'), None)),
+            ('Sentiment Distribution', df['Sentiment_Label'].value_counts().plot(kind='pie', autopct='%1.1f%%'), None),
+            ('Hourly Activity', hourly.plot(kind='line'), ('Hour', 'Tweets')),
+            ('Tweets per Search Hashtag', df['Source_Hashtag'].value_counts().plot(kind='bar'), None)
+        ]
+        for i, (title, plot, labels) in enumerate(plots, 1):
+            plt.subplot(2, 2, i); plot; plt.title(title)
+            if labels: plt.xlabel(labels[0]); plt.ylabel(labels[1])
+        plt.tight_layout(); plt.savefig("twitter_data/visualizations.png")
+        print("Analysis complete. Report saved to twitter_data/analysis_report.txt")
 
 if __name__ == "__main__":
     TwitterScraper().scrape_tweets()
